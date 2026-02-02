@@ -33,6 +33,12 @@
     "type": "string",
     "hint": "使用的Seedream模型版本",
     "default": ""
+  },
+  "show_prompt_in_reply": {
+    "description": "发送图片时是否显示提示词",
+    "type": "bool",
+    "hint": "设置为false则仅发送图片，不显示提示词",
+    "default": true,
+    "obvious_hint": false
   }
-
 }

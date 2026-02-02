@@ -9,14 +9,14 @@
 - 自动校验图片尺寸，适配火山方舟像素要求
 - 自动清理过期图片文件，节省磁盘空间
 - 限流防重，避免重复请求和频率超限
+- 可配置是否在发送图片时显示提示词
 
 ## 安装部署
 1. 将插件文件放入AstrBot的`plugins`目录下
 2. 安装依赖（如未安装）：
    ```bash
    pip install aiohttp
-   ```
-3. 配置文件中填写必要参数（参考下方配置说明）
+   3. 配置文件中填写必要参数（参考下方配置说明）
 
 ## 配置说明
 在AstrBot面板中修改以下配置项：
@@ -31,7 +31,9 @@ astrbot_plugin_seedream_image:
   image_size: "4096x4096"
   # Seedream模型版本
   model_version: ""
-```
+  # 发送图片时是否显示提示词（可选，默认true）
+  show_prompt_in_reply: true
+  ```
 
 | 配置项 | 类型 | 说明 | 默认值 | 注意事项 |
 |--------|------|------|--------|----------|
@@ -39,6 +41,7 @@ astrbot_plugin_seedream_image:
 | VOLC_ENDPOINT | string | API访问端点 | https://ark.cn-beijing.volces.com/api/v3 | 可根据地域调整域名 |
 | image_size | string | 生成图片尺寸 | 4096x4096 | 最低要求1920x1920（3686400像素） |
 | model_version | string | Seedream模型版本 | 空 | 需与账号开通的模型版本匹配 |
+show_prompt_in_reply | boolean | 发送图片时是否显示提示词 | true | 设置为 false 则仅发送图片，不显示提示词 |
 
 ## 使用方法
 ### 基础指令
@@ -96,7 +99,7 @@ astrbot_plugin_seedream_image:
 5. 请遵守火山方舟平台使用规范，合理使用API
 
 ## 版本信息
-- 当前版本：3.2.0
+- 当前版本：3.3.0
 - 适配框架：AstrBot
 - 支持功能：文生图、图生图、自动尺寸校验、自动文件清理
 

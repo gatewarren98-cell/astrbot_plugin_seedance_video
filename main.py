@@ -34,6 +34,8 @@ class SeedreamImagePlugin(Star):
         self.api_endpoint = config.get("VOLC_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3").strip()
         self.image_size = config.get("image_size", "4096x4096").strip()
         self.model_version = config.get("model_version", "seedream-v1").strip()
+        # 新增：是否显示提示词配置
+        self.show_prompt_in_reply = config.get("show_prompt_in_reply", True)
         # 可选配置：仅在特殊场景下允许禁用SSL验证（默认关闭）
         self.allow_insecure_ssl = config.get("allow_insecure_ssl", False)
         
@@ -63,7 +65,7 @@ class SeedreamImagePlugin(Star):
         # 7. 核心配置校验
         if not self.api_key:
             logger.error(f"[{PLUGIN_NAME}] VOLC_API_KEY未配置！请填写火山方舟账号的API KEY")
-        logger.info(f"[{PLUGIN_NAME}] 初始化完成 | 模型版本：{self.model_version} | 生成尺寸：{self.valid_size} | API端点：{self.full_api_url}")
+        logger.info(f"[{PLUGIN_NAME}] 初始化完成 | 模型版本：{self.model_version} | 生成尺寸：{self.valid_size} | API端点：{self.full_api_url} | 显示提示词：{self.show_prompt_in_reply}")
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -372,10 +374,14 @@ class SeedreamImagePlugin(Star):
             if hasattr(event.message_obj, 'message_id'):
                 reply_components.append(Reply(id=event.message_obj.message_id))
             
-            reply_components.extend([
-                Image.fromFileSystem(local_path),
-                Plain(text=f"生成完成\n提示词：{real_prompt or '纯图生图'}")
-            ])
+            # 添加图片
+            reply_components.append(Image.fromFileSystem(local_path))
+            
+            # 根据配置决定是否添加提示词文本
+            if self.show_prompt_in_reply:
+                reply_components.append(Plain(text=f"生成完成\n提示词：{real_prompt or '纯图生图'}"))
+            else:
+                reply_components.append(Plain(text="生成完成"))
             
             yield event.chain_result(reply_components)
             
