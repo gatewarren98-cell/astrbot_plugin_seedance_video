@@ -1,4 +1,5 @@
 name: astrbot_plugin_seedream_image
+display_name: 豆包画图
 author: 寰宇中的星尘
 description: 使用火山方舟seedreamAPI生成图片，触发指令为画图豆包
 version: 3.3.1
