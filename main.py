@@ -16,14 +16,12 @@ from astrbot.api.message_components import Plain, Image, Reply, At
 
 # 插件常量定义
 PLUGIN_NAME = "astrbot_plugin_seedream_image"
-# 火山方舟最低像素要求（3686400 = 1920x1920）
-MIN_PIXELS = 3686400
 # 清理逻辑执行间隔（秒）
 CLEANUP_INTERVAL = 3600  # 1小时
 # aiohttp Session 复用超时
 SESSION_TIMEOUT = aiohttp.ClientTimeout(total=120)
 
-@register(PLUGIN_NAME, "插件开发者", "火山方舟Seedream图片生成（文生图/图生图）", "3.3.0")
+@register(astrbot_plugin_seedream_image, "寰宇中的星尘", "火山方舟Seedream图片生成（文生图/图生图）", "3.3.1", "https://github.com/MarcoHuanxing/astrbot_plugin_seedream_image")
 class SeedreamImagePlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -32,18 +30,18 @@ class SeedreamImagePlugin(Star):
         # 1. 解析配置文件
         self.api_key = config.get("VOLC_API_KEY", "").strip()
         self.api_endpoint = config.get("VOLC_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3").strip()
-        self.image_size = config.get("image_size", "4096x4096").strip()
+        self.image_size = config.get("image_size", "2K").strip()
         self.model_version = config.get("model_version", "seedream-v1").strip()
         # 新增：是否显示提示词配置
         self.show_prompt_in_reply = config.get("show_prompt_in_reply", True)
         # 可选配置：仅在特殊场景下允许禁用SSL验证（默认关闭）
         self.allow_insecure_ssl = config.get("allow_insecure_ssl", False)
         
-        # 2. 校验并处理图片尺寸
+        # 2. 校验并处理图片分辨率
         self.valid_size, self.size_error = self._validate_image_size(self.image_size)
         if self.size_error:
-            logger.warning(f"[{PLUGIN_NAME}] 尺寸配置异常：{self.size_error}，已自动调整为 1920x1920")
-            self.valid_size = "1920x1920"
+            logger.warning(f"[{PLUGIN_NAME}] 分辨率配置异常：{self.size_error}，已自动调整为 2K")
+            self.valid_size = "2K"
         
         # 3. 拼接完整API地址
         self.full_api_url = f"{self.api_endpoint.rstrip('/')}/images/generations"
@@ -109,24 +107,22 @@ class SeedreamImagePlugin(Star):
     # 尺寸校验工具
     # =========================================================
     def _validate_image_size(self, size_str: str) -> Tuple[str, str]:
-        """校验图片尺寸是否符合火山方舟要求"""
-        size_pattern = re.compile(r'^(\d+)x(\d+)$', re.IGNORECASE)
-        match = size_pattern.match(size_str)
+        """
+        校验图片分辨率（方式1：指定分辨率代码）
+        支持1K、2K、3K、4K等分辨率代码
+        """
+        # 支持的分辨率列表
+        valid_resolutions = ["1K", "2K", "3K", "4K"]
         
-        if not match:
-            return "1920x1920", f"尺寸格式错误（{size_str}），需为WxH格式"
+        # 将输入转换为大写以支持小写输入
+        size_upper = size_str.upper().strip()
         
-        width = int(match.group(1))
-        height = int(match.group(2))
-        total_pixels = width * height
+        # 检查是否为有效的分辨率
+        if size_upper in valid_resolutions:
+            return size_upper, ""
         
-        if total_pixels < MIN_PIXELS:
-            return "1920x1920", f"像素总数不足（{total_pixels} < {MIN_PIXELS}）"
-        
-        if width > 8192 or height > 8192:
-            return "4096x4096", f"边长过大（{width}x{height}），已调整为4096x4096"
-        
-        return size_str, ""
+        # 如果不是有效的分辨率格式
+        return "2K", f"分辨率格式错误（{size_str}），支持的分辨率：{', '.join(valid_resolutions)}"
 
     # =========================================================
     # 通用工具方法（优化性能）
