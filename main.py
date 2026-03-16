@@ -1,440 +1,176 @@
 import os
 import time
-import re
 import json
-import uuid
-import aiohttp
 import asyncio
-from urllib.parse import urlparse, quote, unquote
-from typing import Optional, List, Tuple
+import aiohttp
+from typing import Optional, List
 
-# 核心导入
 from astrbot.api import logger
-from astrbot.api.star import Star, Context, StarTools
+from astrbot.api.star import register, Star, Context, StarTools
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Plain, Image, Reply, At
+from astrbot.api.message_components import Plain, Image, Video, Reply
 
-# 插件常量定义
-PLUGIN_NAME = "astrbot_plugin_seedream_image"
-# 清理逻辑执行间隔（秒）
-CLEANUP_INTERVAL = 3600  # 1小时
-# aiohttp Session 复用超时
-SESSION_TIMEOUT = aiohttp.ClientTimeout(total=120)
+PLUGIN_NAME = "astrbot_plugin_seedance_video"
+SESSION_TIMEOUT = aiohttp.ClientTimeout(total=30) # 请求超时时间（不含轮询等待）
 
-class SeedreamImagePlugin(Star):
+@register(PLUGIN_NAME, "开发者", "火山方舟 Seedance 1.5 Pro 视频生成插件", "1.0.0")
+class SeedanceVideoPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        # 1. 解析配置文件
+        # 1. 基础配置
         self.api_key = config.get("VOLC_API_KEY", "").strip()
-        self.api_endpoint = config.get("VOLC_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3").strip()
-        self.image_size = config.get("image_size", "2K").strip()
-        self.model_version = config.get("model_version", "seedream-v1").strip()
-        # 新增：是否显示提示词配置
-        self.show_prompt_in_reply = config.get("show_prompt_in_reply", True)
-        # 可选配置：仅在特殊场景下允许禁用SSL验证（默认关闭）
-        self.allow_insecure_ssl = config.get("allow_insecure_ssl", False)
+        self.api_endpoint = config.get("VOLC_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3")
+        self.model_version = config.get("model_version", "doubao-seedance-1-5-pro-251215")
         
-        # 2. 校验并处理图片分辨率
-        self.valid_size, self.size_error = self._validate_image_size(self.image_size)
-        if self.size_error:
-            logger.warning(f"[{PLUGIN_NAME}] 分辨率配置异常：{self.size_error}，已自动调整为 2K")
-            self.valid_size = "2K"
+        # 2. 拼接 API 路径
+        self.tasks_url = f"{self.api_endpoint.rstrip('/')}/contents/generations/tasks"
         
-        # 3. 拼接完整API地址
-        self.full_api_url = f"{self.api_endpoint.rstrip('/')}/images/generations"
-        
-        # 4. 限流/防重配置
-        self.rate_limit_seconds = 10.0
-        self.processing_users = set()
-        self.last_operations = {}
-        
-        # 5. 文件清理配置（优化性能）
-        self.retention_hours = float(config.get("auto_clean_delay", 1.0))
-        self.last_cleanup_time = 0
-        # 异步清理任务锁，避免并发清理
-        self.cleanup_lock = asyncio.Lock()
-        
-        # 6. aiohttp Session 复用（优化连接开销）
+        # 3. 会话与状态管理
         self._session: Optional[aiohttp.ClientSession] = None
-        
-        # 7. 核心配置校验
+        self.processing_users = set()
+
         if not self.api_key:
-            logger.error(f"[{PLUGIN_NAME}] VOLC_API_KEY未配置！请填写火山方舟账号的API KEY")
-        logger.info(f"[{PLUGIN_NAME}] 初始化完成 | 模型版本：{self.model_version} | 生成尺寸：{self.valid_size} | API端点：{self.full_api_url} | 显示提示词：{self.show_prompt_in_reply}")
+            logger.error(f"[{PLUGIN_NAME}] 警告：VOLC_API_KEY 未配置！")
 
     @property
     def session(self) -> aiohttp.ClientSession:
-        """复用aiohttp ClientSession，减少TCP连接开销"""
         if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(
-                ssl=not self.allow_insecure_ssl,  # 修复SSL验证问题：默认启用，仅配置允许时禁用
-                limit=10,  # 限制并发连接数
-                limit_per_host=5
-            )
-            self._session = aiohttp.ClientSession(
-                timeout=SESSION_TIMEOUT,
-                connector=connector
-            )
+            self._session = aiohttp.ClientSession(timeout=SESSION_TIMEOUT)
         return self._session
 
     async def terminate(self):
-        """插件卸载时清理资源（新增：关闭复用的Session）"""
-        # 清理图片文件
-        save_dir = StarTools.get_data_dir(PLUGIN_NAME) / "images"
-        if save_dir.exists():
-            for filename in os.listdir(save_dir):
-                file_path = save_dir / filename
-                if file_path.is_file():
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
-            try:
-                os.rmdir(save_dir)
-            except Exception:
-                pass
-        
-        # 关闭复用的Session
+        """插件卸载时关闭连接"""
         if self._session and not self._session.closed:
             await self._session.close()
-        
-        logger.info(f"[{PLUGIN_NAME}] 插件已卸载，资源清理完成")
 
-    # =========================================================
-    # 尺寸校验工具
-    # =========================================================
-    def _validate_image_size(self, size_str: str) -> Tuple[str, str]:
-        """
-        校验图片分辨率（方式1：指定分辨率代码）
-        支持1K、2K、3K、4K等分辨率代码
-        """
-        # 支持的分辨率列表
-        valid_resolutions = ["1K", "2K", "3K", "4K"]
-        
-        # 将输入转换为大写以支持小写输入
-        size_upper = size_str.upper().strip()
-        
-        # 检查是否为有效的分辨率
-        if size_upper in valid_resolutions:
-            return size_upper, ""
-        
-        # 如果不是有效的分辨率格式
-        return "2K", f"分辨率格式错误（{size_str}），支持的分辨率：{', '.join(valid_resolutions)}"
-
-    # =========================================================
-    # 通用工具方法（优化性能）
-    # =========================================================
-    async def _cleanup_temp_files(self):
-        """
-        异步清理过期图片文件（优化：
-        1. 仅间隔1小时执行一次
-        2. 异步执行不阻塞主流程
-        3. 加锁避免并发清理
-        """
-        if self.retention_hours <= 0:
-            return
-            
-        async with self.cleanup_lock:
-            now = time.time()
-            # 检查是否达到清理间隔
-            if now - self.last_cleanup_time < CLEANUP_INTERVAL:
-                return
-
-            save_dir = StarTools.get_data_dir(PLUGIN_NAME) / "images"
-            if not save_dir.exists():
-                self.last_cleanup_time = now
-                return
-
-            retention_seconds = self.retention_hours * 3600
-            deleted_count = 0
-
-            try:
-                # 使用异步遍历（减少阻塞）
-                for filename in os.listdir(save_dir):
-                    file_path = save_dir / filename
-                    if file_path.is_file() and now - file_path.stat().st_mtime > retention_seconds:
-                        try:
-                            os.remove(file_path)
-                            deleted_count += 1
-                        except Exception as del_err:
-                            logger.warning(f"[{PLUGIN_NAME}] 删除过期文件失败 {filename}: {del_err}")
-                
-                if deleted_count > 0:
-                    logger.info(f"[{PLUGIN_NAME}] 清理完成，共删除 {deleted_count} 张过期图片")
-                
-                self.last_cleanup_time = now
-                
-            except Exception as e:
-                logger.warning(f"[{PLUGIN_NAME}] 自动清理流程异常: {e}")
-
-    async def _download_generated_image(self, url: str) -> str:
-        """下载API生成的图片（优化：复用Session，启用SSL验证）"""
-        # 异步执行清理（不阻塞下载流程）
-        asyncio.create_task(self._cleanup_temp_files())
-        
-        if not url or not url.startswith("http"):
-            raise Exception("无效的图片URL")
-        
-        url = unquote(url)
-        url = quote(url, safe=':/?&=')
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": urlparse(self.api_endpoint).netloc or "https://ark.cn-beijing.volces.com/"
-        }
-        
-        try:
-            # 复用全局Session（优化连接开销）
-            async with self.session.get(
-                url, 
-                headers=headers,
-                allow_redirects=True
-            ) as resp:
-                if resp.status != 200:
-                    raise Exception(f"下载失败 [HTTP {resp.status}]")
-                image_data = await resp.read()
-        
-            # 保存图片
-            save_dir = StarTools.get_data_dir(PLUGIN_NAME) / "images"
-            save_dir.mkdir(parents=True, exist_ok=True)
-            
-            file_name = f"seedream_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
-            save_path = save_dir / file_name
-            
-            with open(save_path, "wb") as f:
-                f.write(image_data)
-                
-            return str(save_path)
-            
-        except Exception as e:
-            raise Exception(f"图片下载失败: {str(e)}")
-
-    def _extract_image_url_list(self, event: AstrMessageEvent) -> List[str]:
-        """
-        优先从引用消息中获取图片，其次获取当前消息中的图片
-        优先级：引用消息的图片 > 当前消息的 Image 组件 > At 组件（用户头像）
-        """
-        image_urls = []
-        
-        if not hasattr(event, 'message_obj') or not event.message_obj or not event.message_obj.message:
-            return image_urls
-        
-        # 第一优先级：从引用消息中获取图片
-        for component in event.message_obj.message:
-            if isinstance(component, Reply) and component.chain:
-                reply_images = self._extract_images_from_chain(component.chain)
-                image_urls.extend(reply_images)
-                # 如果从引用中获取到图片，直接返回（优先使用引用中的图片）
-                if image_urls:
-                    return image_urls
-        
-        # 第二优先级：从当前消息中获取 Image 组件
-        for component in event.message_obj.message:
-            if isinstance(component, Image):
-                img_url = self._extract_image_url(component)
-                if img_url and img_url not in image_urls:
-                    image_urls.append(img_url)
-        
-        # 如果获取到 Image 组件，直接返回
-        if image_urls:
-            return image_urls
-        
-        # 第三优先级：从 At 组件获取用户头像（图生图的参考图像）
-        for component in event.message_obj.message:
-            if isinstance(component, At):
-                if str(component.qq).isdigit():
-                    avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={component.qq}&s=640"
-                    if avatar_url not in image_urls:
-                        image_urls.append(avatar_url)
-        
-        return image_urls
-    
-    def _extract_image_url(self, component: Image) -> str:
-        """从 Image 组件中提取 URL"""
-        if hasattr(component, 'url') and component.url:
-            return component.url.strip()
-        elif hasattr(component, 'file_id') and component.file_id:
-            file_id = component.file_id.replace("/", "_")
-            return f"https://gchat.qpic.cn/gchatpic_new/0/0-0-{file_id}/0?tp=webp&wxfrom=5&wx_lazy=1"
-        return ""
-    
-    def _extract_images_from_chain(self, chain) -> List[str]:
-        """从消息链中提取所有图片 URL"""
-        images = []
-        if not chain:
-            return images
-        
-        for segment in chain:
-            if isinstance(segment, Image):
-                img_url = self._extract_image_url(segment)
-                if img_url and img_url not in images:
-                    images.append(img_url)
-            elif isinstance(segment, Reply) and segment.chain:
-                # 递归处理嵌套引用
-                nested_images = self._extract_images_from_chain(segment.chain)
-                images.extend(nested_images)
-        
-        return images
-
-    # =========================================================
-    # 核心API调用逻辑（优化异常处理粒度）
-    # =========================================================
-    async def _call_seedream_api(self, prompt: str, image_urls: List[str] = None):
-        """调用火山方舟Seedream API（优化：复用Session，精简异常处理）"""
-        if not self.api_key:
-            raise Exception("VOLC_API_KEY未配置")
-        
-        # 构建基础请求体
-        payload = {
-            "model": self.model_version,
-            "prompt": prompt.strip() or "高质量高清图片",
-            "size": self.valid_size,
-            "watermark": False
-        }
-        
-        # 图生图参数
-        if image_urls and len(image_urls) > 0:
-            payload["image"] = image_urls
-        
-        # 请求头
-        headers = {
-            'Authorization': f'Bearer {self.api_key}',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        
-        try:
-            # 复用全局Session
-            async with self.session.post(
-                self.full_api_url,
-                headers=headers,
-                json=payload
-            ) as resp:
-                response_text = await resp.text()
-                
-                # 解析响应（精简异常处理）
-                try:
-                    response_data = json.loads(response_text)
-                except json.JSONDecodeError:
-                    raise Exception(f"API返回非JSON格式响应：{response_text[:200]}")
-                
-                # 处理错误响应
-                if resp.status != 200:
-                    error_msg = response_data.get("error", {}).get("message", f"请求失败 [HTTP {resp.status}]")
-                    error_code = response_data.get("error", {}).get("code", "")
-                    
-                    # 精简错误码映射
-                    error_mapping = {
-                        "InvalidParameter": "参数错误",
-                        "Unauthorized": "API KEY无效或未授权",
-                        "Forbidden": "API KEY无使用权限",
-                        "TooManyRequests": "调用频率超限"
-                    }
-                    
-                    if error_code in error_mapping:
-                        error_msg = f"{error_mapping[error_code]}：{error_msg}"
-                    raise Exception(error_msg)
-                
-                # 提取图片URL
-                if not response_data.get("data") or len(response_data["data"]) == 0:
-                    raise Exception("API返回无图片数据")
-                
-                generated_url = response_data["data"][0].get("url")
-                if not generated_url:
-                    raise Exception("API返回无图片URL")
-                
-                return generated_url
-        
-        except aiohttp.ClientError as e:
-            raise Exception(f"网络请求失败：{str(e)}")
-        except Exception as e:
-            raise Exception(f"API调用失败：{str(e)}")
-
-    # =========================================================
-    # 指令处理（精简输出）
-    # =========================================================
-    @filter.command("豆包")
-    async def generate_image(self, event: AstrMessageEvent, prompt: str = ""):
-        """
-        火山方舟Seedream图片生成（支持文生图、图生图、引用生图）
-        
-        使用方法：
-        1. 文生图：豆包 <提示词>
-        2. 图生图：豆包 <提示词> + 发送图片
-        3. 引用生图：回复他人消息 + 豆包 <提示词>（优先使用引用中的图片）
-        4. 头像参考：豆包 <提示词> + @某人（当无图片时使用 @用户 的头像作参考）
-        """
-        # 提取完整提示词
-        full_text = ""
+    def _extract_image_url(self, event: AstrMessageEvent) -> str:
+        """从消息中提取第一张图片的 URL"""
         if hasattr(event, 'message_obj') and event.message_obj and event.message_obj.message:
             for component in event.message_obj.message:
-                if isinstance(component, Plain):
-                    full_text += component.text
-        
-        if not full_text:
-            full_text = prompt
-        
-        # 移除指令关键词
-        real_prompt = re.sub(r'^.*?豆包', '', full_text).strip()
-        
-        # 提取图片URL列表
-        image_urls = self._extract_image_url_list(event)
-        
-        # 基础校验
+                if isinstance(component, Image):
+                    if hasattr(component, 'url') and component.url:
+                        return component.url.strip()
+        return ""
+
+    def _find_video_url(self, data: dict) -> str:
+        """递归查找字典中的 mp4/视频 URL，防止 API 返回结构变动"""
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, str) and (v.startswith("http") and (".mp4" in v or "video" in v)):
+                    return v
+                elif isinstance(v, (dict, list)):
+                    res = self._find_video_url(v)
+                    if res: return res
+        elif isinstance(data, list):
+            for item in data:
+                res = self._find_video_url(item)
+                if res: return res
+        return ""
+
+    @filter.command("视频豆包")
+    async def generate_video(self, event: AstrMessageEvent, prompt: str = ""):
+        """
+        触发指令：/视频豆包 [提示词]
+        支持附带图片或引用图片进行图生视频
+        """
         user_id = event.get_sender_id()
-        
-        # 防抖检查
-        current_time = time.time()
-        if user_id in self.last_operations:
-            if current_time - self.last_operations[user_id] < self.rate_limit_seconds:
-                yield event.plain_result("操作过快，请稍后再试")
-                return
-        self.last_operations[user_id] = current_time
-        
-        # 防重复处理
+        real_prompt = prompt.strip()
+        image_url = self._extract_image_url(event)
+
+        if not self.api_key:
+            yield event.plain_result("❌ 管理员未配置火山方舟 API KEY。")
+            return
+
+        if not real_prompt and not image_url:
+            yield event.plain_result("❌ 请提供视频的画面描述（提示词），例如：/视频豆包 女孩在森林里奔跑")
+            return
+
         if user_id in self.processing_users:
-            yield event.plain_result("有正在进行的生图任务，请稍候")
+            yield event.plain_result("⏳ 你有一个正在生成的视频任务，请耐心等待完成...")
             return
-        
-        # 无提示词且无图片
-        if not real_prompt and not image_urls:
-            yield event.plain_result("请提供提示词或图片")
-            return
-        
-        # 开始生成
+
         self.processing_users.add(user_id)
+        
+        # 1. 先回复用户，告知任务已受理（视频生成需要几分钟，避免用户以为卡死了）
+        yield event.plain_result("🎬 视频任务已提交！\nSeedance 1.5 Pro 正在为您渲染...\n⏳ 预计需要 3~5 分钟，完成后会自动发送，请耐心等待。")
+
         try:
-            # 精简的状态提示
-            yield event.plain_result("开始生成图片...")
+            # --- 步骤 1：提交任务 ---
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
             
-            # 调用API
-            generated_url = await self._call_seedream_api(real_prompt, image_urls)
+            content_list = []
+            if real_prompt:
+                content_list.append({"type": "text", "text": real_prompt})
+            if image_url:
+                content_list.append({"type": "image_url", "image_url": {"url": image_url}})
+
+            payload = {
+                "model": self.model_version,
+                "content": content_list,
+                "generate_audio": True,
+                "ratio": "adaptive",
+                "duration": 5,
+                "watermark": False
+            }
+
+            async with self.session.post(self.tasks_url, headers=headers, json=payload) as resp:
+                res_data = await resp.json()
+                if resp.status != 200:
+                    raise Exception(res_data.get("error", {}).get("message", f"HTTP {resp.status}"))
+                
+                # 兼容不同的返回字段名
+                task_id = res_data.get("id") or res_data.get("task_id")
+                if not task_id:
+                    raise Exception(f"未获取到 Task ID: {res_data}")
+
+            logger.info(f"[{PLUGIN_NAME}] 视频任务已提交，Task ID: {task_id}")
+
+            # --- 步骤 2：长轮询检查状态 ---
+            video_url = ""
+            max_retries = 60 # 最多轮询 60 次 (60 * 10s = 10 分钟)
             
-            # 下载图片（无提示）
-            local_path = await self._download_generated_image(generated_url)
-            
-            # 构造回复（精简结果）
-            reply_components = []
+            for _ in range(max_retries):
+                await asyncio.sleep(10) # 每 10 秒查询一次
+                
+                poll_url = f"{self.tasks_url}/{task_id}"
+                async with self.session.get(poll_url, headers=headers) as poll_resp:
+                    poll_data = await poll_resp.json()
+                    
+                    status = poll_data.get("status", "").lower()
+                    
+                    if status in ["succeeded", "success", "completed"]:
+                        # 尝试提取视频 URL
+                        video_url = self._find_video_url(poll_data)
+                        break
+                    elif status in ["failed", "error", "cancelled"]:
+                        error_msg = poll_data.get("error", {}).get("message", "任务失败被服务端终止")
+                        raise Exception(f"生成失败: {error_msg}")
+                    # 如果是 pending / running / queued，则继续循环
+
+            if not video_url:
+                raise Exception("任务已超时或未在返回数据中找到视频 URL。")
+
+            # --- 步骤 3：发送最终视频 ---
+            final_res = event.make_result()
             if hasattr(event.message_obj, 'message_id'):
-                reply_components.append(Reply(id=event.message_obj.message_id))
+                final_res.chain.append(Reply(id=event.message_obj.message_id))
             
-            # 添加图片
-            reply_components.append(Image.fromFileSystem(local_path))
+            # 使用 URL 发送视频 (NapCat 等适配器通常支持直传网络视频 URL)
+            final_res.chain.append(Video.fromURL(video_url))
+            final_res.chain.append(Plain(text=f"\n✅ 视频生成完毕！\n💡 提示词：{real_prompt or '纯图生视频'}"))
             
-            # 根据配置决定是否添加提示词文本
-            if self.show_prompt_in_reply:
-                reply_components.append(Plain(text=f"生成完成\n提示词：{real_prompt or '纯图生图'}"))
-            else:
-                reply_components.append(Plain(text="生成完成"))
-            
-            yield event.chain_result(reply_components)
-            
+            # 【关键】因为这里已经脱离了最开始的 yield 生命周期，必须使用 await event.send() 强制发送
+            await event.send(final_res)
+
         except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] 生图失败（用户{user_id}）: {str(e)}")
-            yield event.plain_result(f"生成失败：{str(e)}")
+            logger.error(f"[{PLUGIN_NAME}] 视频生成异常: {e}")
+            error_res = event.make_result().message(f"❌ 视频生成失败：{str(e)}")
+            await event.send(error_res)
             
         finally:
-            if user_id in self.processing_users:
-                self.processing_users.remove(user_id)
+            self.processing_users.discard(user_id)
