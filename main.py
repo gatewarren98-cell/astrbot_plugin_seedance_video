@@ -11,18 +11,26 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Plain, Image, Video, Reply
 
 PLUGIN_NAME = "astrbot_plugin_seedance_video"
-SESSION_TIMEOUT = aiohttp.ClientTimeout(total=30) # 请求超时时间（不含轮询等待）
+SESSION_TIMEOUT = aiohttp.ClientTimeout(total=30) 
 
 @register(PLUGIN_NAME, "开发者", "火山方舟 Seedance 1.5 Pro 视频生成插件", "1.0.0")
 class SeedanceVideoPlugin(Star):
-    def __init__(self, context: Context, config: dict):
+    # 👇 修复点：去掉了强制的 config: dict 参数
+    def __init__(self, context: Context):
         super().__init__(context)
-        self.config = config
         
         # 1. 基础配置
-        self.api_key = config.get("VOLC_API_KEY", "").strip()
-        self.api_endpoint = config.get("VOLC_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3")
-        self.model_version = config.get("model_version", "doubao-seedance-1-5-pro-251215")
+        # 建议直接在这里把你的 API_KEY 填入字符串中，最简单粗暴
+        self.api_key = "你的火山方舟_API_KEY_填在这里"  
+        self.api_endpoint = "https://ark.cn-beijing.volces.com/api/v3"
+        self.model_version = "doubao-seedance-1-5-pro-251215"
+        
+        # --- 如果你更喜欢用本地 json 存配置，可以取消下面这段代码的注释 ---
+        # config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        # if os.path.exists(config_path):
+        #     with open(config_path, "r", encoding="utf-8") as f:
+        #         config = json.load(f)
+        #         self.api_key = config.get("VOLC_API_KEY", self.api_key).strip()
         
         # 2. 拼接 API 路径
         self.tasks_url = f"{self.api_endpoint.rstrip('/')}/contents/generations/tasks"
@@ -31,9 +39,8 @@ class SeedanceVideoPlugin(Star):
         self._session: Optional[aiohttp.ClientSession] = None
         self.processing_users = set()
 
-        if not self.api_key:
-            logger.error(f"[{PLUGIN_NAME}] 警告：VOLC_API_KEY 未配置！")
-
+        if not self.api_key or self.api_key.startswith("你的"):
+            logger.error(f"[{PLUGIN_NAME}] 警告：API KEY 未配置，功能将无法使用！")
     @property
     def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
